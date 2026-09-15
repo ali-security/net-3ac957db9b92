@@ -1,0 +1,88 @@
+name: build
+
+# golang.org/x/net is developed on Gerrit (go.googlesource.com/net) and has no
+# GitHub Actions CI of its own. This workflow is written for the sealed build:
+# it produces the module source zip that proxy.golang.org serves, then proves
+# the tree compiles and the project's own `go test ./...` suite passes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: auto
+      GOPROXY: https://time-machines-go.sealsecurity.io/|https://proxy.golang.org|direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Report toolchain
+        run: go version
+
+      # Stage a copy of the module tree and drop this workflow from it: the
+      # published module zip carries no .github/ members, and zip.CreateFromDir
+      # packages every file it finds in the directory it is given.
+      - name: Stage module tree
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/modsrc
+          cp -a "$GITHUB_WORKSPACE"/. /tmp/modsrc/
+          rm -rf /tmp/modsrc/.git /tmp/modsrc/.github
+          ls -la /tmp/modsrc
+
+      # Built from the staged tree BEFORE go build / go test, so no compiler or
+      # test byproduct can leak into the artifact. golang.org/x/mod/zip applies
+      # the module proxy's own inclusion rules, so the file set matches by
+      # construction.
+      - name: Build module zip
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/zipper
+          cp "$GITHUB_WORKSPACE/.github/modzip/create_mod.go" /tmp/zipper/
+          cd /tmp/zipper
+          go mod init example.com/modzip
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.28.0
+          mkdir -p "$GITHUB_WORKSPACE/build_output"
+          GOFLAGS=-mod=mod go run create_mod.go golang.org/x/net v0.45.0 /tmp/modsrc "$GITHUB_WORKSPACE/build_output/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | tail -n 5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          set -euxo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            go test -v -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
